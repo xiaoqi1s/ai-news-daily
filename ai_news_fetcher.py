@@ -134,6 +134,101 @@ class TencentTranslator:
             return ""
 
 
+class GitHubTrendingFetcher:
+    """GitHub热门大模型/Agent开源项目抓取器"""
+
+    # 搜索关键词组合，覆盖大模型 / Agent 主题
+    SEARCH_QUERIES = [
+        "topic:llm topic:agent",
+        "topic:large-language-model topic:agent",
+        "topic:llm-agent",
+        "topic:ai-agent topic:llm",
+        "large language model agent stars:>500",
+    ]
+
+    def __init__(self, github_token: str = None):
+        """
+        初始化 GitHub 热门项目抓取器
+
+        Args:
+            github_token: GitHub Personal Access Token（可选，提高 API 速率限制）
+        """
+        self.headers = {
+            "Accept": "application/vnd.github.v3+json",
+        }
+        if github_token:
+            self.headers["Authorization"] = f"Bearer {github_token}"
+
+    def fetch_trending_repos(self, count: int = 10) -> List[Dict]:
+        """
+        获取 GitHub 上热门的大模型 / Agent 开源项目
+
+        Args:
+            count: 返回项目数量，默认 10
+
+        Returns:
+            项目列表，按 star 数降序排列
+        """
+        all_repos: List[Dict] = []
+        seen_ids: set = set()
+
+        for query in self.SEARCH_QUERIES:
+            try:
+                url = "https://api.github.com/search/repositories"
+                params = {
+                    "q": query,
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": 30,
+                }
+                response = requests.get(
+                    url, headers=self.headers, params=params, timeout=30
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    for repo in data.get("items", []):
+                        if repo["id"] not in seen_ids:
+                            seen_ids.add(repo["id"])
+                            description = repo.get("description") or ""
+                            try:
+                                updated_date = datetime.fromisoformat(
+                                    repo["updated_at"].replace("Z", "+00:00")
+                                ).strftime('%Y-%m-%d')
+                            except (ValueError, KeyError):
+                                updated_date = repo.get("updated_at", "")[:10]
+                            all_repos.append(
+                                {
+                                    "name": repo["full_name"],
+                                    "description": description,
+                                    "stars": repo["stargazers_count"],
+                                    "forks": repo["forks_count"],
+                                    "url": repo["html_url"],
+                                    "language": repo.get("language") or "",
+                                    "topics": repo.get("topics", []),
+                                    "updated_at": updated_date,
+                                }
+                            )
+                elif response.status_code == 403:
+                    print(
+                        "  ⚠️ GitHub API 速率限制，请配置 GITHUB_TOKEN 环境变量以提高限额"
+                    )
+                    break
+                else:
+                    print(f"  ⚠️ GitHub API 返回异常状态码: {response.status_code}")
+
+                # 避免触发 GitHub 次要速率限制
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"  ✗ GitHub 抓取失败: {str(e)}")
+
+        # 按 star 数降序排列，取前 count 个
+        all_repos.sort(key=lambda x: x["stars"], reverse=True)
+        top_repos = all_repos[:count]
+        print(f"✓ 共获取到 {len(top_repos)} 个 GitHub 热门大模型/Agent 开源项目")
+        return top_repos
+
+
 class AINewsFetcher:
     """AI新闻抓取器"""
     
@@ -233,6 +328,7 @@ class AINewsFetcher:
     def __init__(self, translator: TencentTranslator = None):
         self.news_items: List[Dict] = []
         self.chinese_news_items: List[Dict] = []
+        self.github_repos: List[Dict] = []
         self.time_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
         self.translator = translator
     
@@ -363,14 +459,16 @@ class AINewsFetcher:
     
     def format_for_wechat(self) -> tuple:
         """格式化新闻内容用于微信推送（中英双语版）"""
-        if not self.news_items and not self.chinese_news_items:
+        if not self.news_items and not self.chinese_news_items and not self.github_repos:
             return "今日AI资讯", "暂无最新AI科技资讯"
 
         title = f"📰 AI科技日报 ({datetime.now().strftime('%Y-%m-%d')})"
 
         content_lines = [
             f"## 🤖 过去24小时AI科技要闻\n",
-            f"共收集到 **{len(self.news_items)}** 条国际资讯（中英双语）、**{len(self.chinese_news_items)}** 条国内资讯\n",
+            f"共收集到 **{len(self.news_items)}** 条国际资讯（中英双语）、**{len(self.chinese_news_items)}** 条国内资讯"
+            + (f"、**{len(self.github_repos)}** 个GitHub热门大模型/Agent项目" if self.github_repos else "")
+            + "\n",
             "---\n"
         ]
 
@@ -414,6 +512,26 @@ class AINewsFetcher:
                     f"- 📎 [阅读原文]({item['link']})\n\n"
                 )
 
+        # ── GitHub热门大模型/Agent项目 ──────────────────────────
+        if self.github_repos:
+            content_lines.append("---\n\n")
+            content_lines.append("## 🔥 GitHub热门大模型/Agent开源项目 TOP 10\n\n")
+            for i, repo in enumerate(self.github_repos, 1):
+                content_lines.append(f"### {i}. [{repo['name']}]({repo['url']})\n")
+
+                if repo.get('description'):
+                    content_lines.append(f"> {repo['description']}\n\n")
+
+                lang_str = f"语言: {repo['language']}  " if repo.get('language') else ""
+                topics_str = ""
+                if repo.get('topics'):
+                    topics_str = f"标签: {', '.join(repo['topics'][:5])}  "
+                content_lines.append(
+                    f"- ⭐ Stars: {repo['stars']:,}  🍴 Forks: {repo['forks']:,}\n"
+                    f"- {lang_str}{topics_str}\n"
+                    f"- 🕐 最近更新: {repo['updated_at']}\n\n"
+                )
+
         content_lines.append("\n---\n")
         content_lines.append(f"*由 GitHub Actions 自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
         content_lines.append("*翻译由腾讯云机器翻译提供*")
@@ -440,9 +558,11 @@ class AINewsFetcher:
         # 摘要行
         total_intl = len(self.news_items)
         total_cn = len(self.chinese_news_items)
-        paragraphs.append([
-            _text(f"🤖 过去24小时：{total_intl} 条国际资讯，{total_cn} 条国内资讯")
-        ])
+        total_gh = len(self.github_repos)
+        summary_text = f"🤖 过去24小时：{total_intl} 条国际资讯，{total_cn} 条国内资讯"
+        if total_gh:
+            summary_text += f"，{total_gh} 个GitHub热门大模型/Agent项目"
+        paragraphs.append([_text(summary_text)])
         paragraphs.append([_text("─" * 30)])
 
         # ── 国际新闻 ─────────────────────────────────────────
@@ -493,6 +613,26 @@ class AINewsFetcher:
 
                 paragraphs.append([
                     _text(f"   🔗 {item['source']}  🕐 {item['pub_time']}")
+                ])
+
+        # ── GitHub热门大模型/Agent项目 ──────────────────────────
+        if self.github_repos:
+            paragraphs.append([_text("─" * 30)])
+            paragraphs.append([_bold("🔥 GitHub热门大模型/Agent开源项目 TOP 10")])
+            for i, repo in enumerate(self.github_repos, 1):
+                row = [_text(f"{i}. ")]
+                row.append(_link(repo['name'], repo['url']))
+                paragraphs.append(row)
+
+                if repo.get('description'):
+                    desc = repo['description'][:120]
+                    if len(repo['description']) > 120:
+                        desc += "..."
+                    paragraphs.append([_text(f"   💡 {desc}")])
+
+                lang_str = f"  语言: {repo['language']}" if repo.get('language') else ""
+                paragraphs.append([
+                    _text(f"   ⭐ {repo['stars']:,}  🍴 {repo['forks']:,}{lang_str}  🕐 {repo['updated_at']}")
                 ])
 
         paragraphs.append([_text("─" * 30)])
@@ -633,6 +773,7 @@ def main():
     tencent_secret_key = os.environ.get('TENCENT_SECRET_KEY')
     feishu_webhook_url = os.environ.get('FEISHU_WEBHOOK_URL')
     feishu_secret = os.environ.get('FEISHU_SECRET')
+    github_token = os.environ.get('GITHUB_TOKEN')
 
     # 检查至少有一个推送渠道可用
     if not sendkey and not feishu_webhook_url:
@@ -654,12 +795,17 @@ def main():
     news = fetcher.fetch_all()
     
     print(f"\n✓ 共处理 {len(news)} 条国际AI相关新闻，{len(fetcher.chinese_news_items)} 条国内AI相关新闻\n")
-    
-    # 2. 格式化内容
+
+    # 2. 抓取 GitHub 热门大模型/Agent 开源项目
+    print("\n🐙 开始抓取 GitHub 热门大模型/Agent 开源项目...\n")
+    github_fetcher = GitHubTrendingFetcher(github_token=github_token)
+    fetcher.github_repos = github_fetcher.fetch_trending_repos(count=10)
+
+    # 3. 格式化内容
     title, wechat_content = fetcher.format_for_wechat()
     feishu_payload = fetcher.format_for_feishu()
 
-    # 3. 保存新闻到文件（维持仓库活跃，防止GitHub禁用定时任务）
+    # 4. 保存新闻到文件（维持仓库活跃，防止GitHub禁用定时任务）
     news_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     news_dir = 'news'
     os.makedirs(news_dir, exist_ok=True)
@@ -669,7 +815,7 @@ def main():
         f.write(wechat_content)
     print(f"✓ 新闻已保存到 {news_file}")
 
-    # 4. 推送到微信（Server酱）
+    # 5. 推送到微信（Server酱）
     overall_success = False
     if sendkey:
         print("📤 正在推送到微信（Server酱）...")
@@ -679,7 +825,7 @@ def main():
     else:
         print("⚠️ 未配置 SERVERCHAN_SENDKEY，跳过微信推送")
 
-    # 5. 推送到飞书
+    # 6. 推送到飞书
     if feishu_webhook_url:
         print("📤 正在推送到飞书...")
         feishu_pusher = FeishuPusher(feishu_webhook_url, secret=feishu_secret)
