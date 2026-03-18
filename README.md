@@ -1,6 +1,6 @@
 # 📰 ai-news-daily
 
-每日自动抓取国际 & 国内 AI 科技资讯，翻译后推送到**微信**（Server酱）和/或**飞书**。
+每日自动抓取国际 & 国内 AI 科技资讯、GitHub 热门大模型/Agent 开源项目，翻译后推送到**微信**（Server酱）和/或**飞书**。
 
 ---
 
@@ -10,6 +10,7 @@
 |------|------|
 | 🌍 国际 AI 资讯 | 每日从 MIT TR、VentureBeat、TechCrunch 等 7 个英文源抓取最多 20 条资讯 |
 | 🇨🇳 国内 AI 资讯 | 从机器之心、量子位、36氪等 10 个中文源抓取最多 10 条资讯 |
+| 🔥 GitHub 热门项目 | 每日从 GitHub 搜索与大模型/Agent 相关的热门开源项目，按 Star 数取 Top 10 |
 | 🌐 自动翻译 | 使用腾讯云机器翻译将英文标题、摘要翻译为中文（可选） |
 | 📱 微信推送 | 通过 Server酱 推送到微信（可选） |
 | 🔔 飞书推送 | 通过飞书自定义机器人 Webhook 推送富文本消息（可选） |
@@ -36,8 +37,9 @@
 | `SERVERCHAN_SENDKEY` | 二选一 | Server酱的 SendKey（微信推送，见下方配置指南） |
 | `TENCENT_SECRET_ID` | 可选 | 腾讯云 SecretId（用于英文翻译） |
 | `TENCENT_SECRET_KEY` | 可选 | 腾讯云 SecretKey（用于英文翻译） |
+| `GITHUB_TOKEN` | 无需配置 | GitHub Actions 自动提供，用于调用 GitHub API 抓取热门项目（见下方说明） |
 
-> `FEISHU_WEBHOOK_URL` 和 `SERVERCHAN_SENDKEY` 至少填一个，否则脚本会报错退出。翻译功能不填则自动跳过。
+> `FEISHU_WEBHOOK_URL` 和 `SERVERCHAN_SENDKEY` 至少填一个，否则脚本会报错退出。翻译功能不填则自动跳过。`GITHUB_TOKEN` 由 GitHub 自动注入，无需手动创建。
 
 ### 第三步：手动触发一次验证
 
@@ -89,7 +91,7 @@
 ```
 📰 AI科技日报 (2026-03-16)
 
-🤖 过去24小时：20 条国际资讯，10 条国内资讯
+🤖 过去24小时：20 条国际资讯，10 条国内资讯，10 个GitHub热门大模型/Agent项目
 ──────────────────────────────
 🌍 国际AI科技资讯
 1. [OpenAI 发布 o3 模型](https://...)
@@ -102,6 +104,12 @@
 1. [百度文心一言重大更新](https://...)
    💡 百度今日宣布...
    🔗 机器之心  🕐 2026-03-16 07:00
+──────────────────────────────
+🔥 GitHub热门大模型/Agent开源项目 TOP 10
+1. openai/openai-agents-python
+   💡 OpenAI Agents SDK for Python
+   ⭐ 12,500  🍴 800  语言: Python  🕐 2026-03-16
+...
 ```
 
 ---
@@ -123,6 +131,47 @@
 2. 前往 **访问管理 → API密钥管理** → 新建密钥，获取 `SecretId` 和 `SecretKey`
 3. 开通 **机器翻译（TMT）** 服务（每月有免费额度）
 4. 将两个值分别保存到 GitHub Secrets：`TENCENT_SECRET_ID`、`TENCENT_SECRET_KEY`
+
+---
+
+## 🐙 GitHub 热门项目配置说明
+
+本项目每天会自动调用 **GitHub Search API**，按 Star 数搜索与大模型（LLM）和 AI Agent 相关的热门开源仓库，取前 10 名，并一同推送到飞书和微信。
+
+### GITHUB_TOKEN：无需手动配置
+
+工作流文件已包含以下配置：
+
+```yaml
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+`GITHUB_TOKEN` 是 **GitHub Actions 内置的临时令牌**，每次工作流运行时由 GitHub 自动生成并注入，**你无需在 Secrets 中手动创建它**。
+
+| 项目 | 说明 |
+|------|------|
+| 来源 | GitHub Actions 自动提供，无需手动配置 |
+| 权限 | 只读，仅用于调用 GitHub 公开 API（搜索仓库） |
+| 速率限制（有 Token） | 5,000 次请求 / 小时，日常使用完全够用 |
+| 速率限制（无 Token） | 60 次请求 / 小时（在 Actions 外本地运行脚本时未设置 Token 的情况） |
+
+### 搜索策略
+
+脚本通过以下关键词组合搜索 GitHub 仓库（取各组 Star 数最高结果后去重，最终返回 Top 10）：
+
+| 查询 | 含义 |
+|------|------|
+| `topic:llm topic:agent` | 同时带有 LLM 和 Agent 标签的仓库 |
+| `topic:large-language-model topic:agent` | 大语言模型 + Agent 标签 |
+| `topic:llm-agent` | 带有 llm-agent 专属标签 |
+| `topic:ai-agent topic:llm` | AI Agent + LLM 标签 |
+| `large language model agent stars:>500` | 关键词匹配且 Star 数超过 500 |
+
+### 如果推送内容中没有 GitHub 项目
+
+- **日志提示"GitHub API 速率限制"**：极少发生，等下一次定时运行即可。
+- **返回 0 条结果**：网络超时或 API 暂时异常，脚本会静默跳过该区块，不影响新闻推送。
 
 ---
 
@@ -158,3 +207,8 @@ schedule:
 
 **Q: GitHub Actions 定时任务停止运行了？**
 - 进入 **Actions** 页面，点击工作流名称，查看是否有"This workflow was disabled"提示，点击 **Enable workflow** 重新启用
+
+**Q: 推送内容里没有 GitHub 热门项目区块？**
+- **正常情况**：当 GitHub API 因网络超时或速率限制未返回数据时，脚本会静默跳过该区块，不影响其他内容推送。
+- **排查步骤**：查看 Actions 日志，搜索 `GitHub` 关键字，确认是否有"速率限制"或"抓取失败"提示。
+- **注意**：`GITHUB_TOKEN` 无需手动配置，GitHub Actions 自动提供；若是在本地手动运行脚本，需自行设置环境变量 `GITHUB_TOKEN`（GitHub 个人访问令牌）。
