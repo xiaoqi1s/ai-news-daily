@@ -14,6 +14,7 @@ import hashlib
 import base64
 import requests
 import feedparser
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict
 
@@ -135,15 +136,36 @@ class TencentTranslator:
 
 
 class GitHubTrendingFetcher:
-    """GitHub热门大模型/Agent开源项目抓取器"""
+    """GitHub热门大模型/Agent开源项目抓取器（最近24小时star增加最多）"""
 
-    # 搜索关键词组合，覆盖大模型 / Agent 主题
-    SEARCH_QUERIES = [
+    # LLM/Agent 相关关键词，用于过滤 Trending 列表
+    LLM_AGENT_KEYWORDS = [
+        "llm", "agent", "gpt", "language model", "large language",
+        "chatbot", "openai", "langchain", "rag", "retrieval",
+        "fine-tun", "finetune", "transformer", "diffusion",
+        "multimodal", "embedding", "vector", "inference",
+        "ollama", "vllm", "llamaindex", "autogen", "crewai",
+        "anthropic", "gemini", "mistral", "llama", "qwen",
+        "deepseek", "phi-", "claude", "copilot", "ai agent",
+        "autonomous agent", "workflow", "mcp",
+    ]
+
+    # GitHub Trending 页面抓取目标（按日统计，涵盖主流 AI 开发语言）
+    TRENDING_URLS = [
+        "https://github.com/trending?since=daily",
+        "https://github.com/trending/python?since=daily",
+        "https://github.com/trending/javascript?since=daily",
+        "https://github.com/trending/typescript?since=daily",
+        "https://github.com/trending/rust?since=daily",
+        "https://github.com/trending/go?since=daily",
+    ]
+
+    # 当 Trending 抓取结果不足时的兜底 GitHub Search 查询
+    FALLBACK_QUERIES = [
         "topic:llm topic:agent",
-        "topic:large-language-model topic:agent",
+        "topic:large-language-model",
         "topic:llm-agent",
-        "topic:ai-agent topic:llm",
-        "large language model agent stars:>500",
+        "topic:ai-agent",
     ]
 
     def __init__(self, github_token: str = None):
@@ -153,36 +175,182 @@ class GitHubTrendingFetcher:
         Args:
             github_token: GitHub Personal Access Token（可选，提高 API 速率限制）
         """
-        self.headers = {
+        self.api_headers = {
             "Accept": "application/vnd.github.v3+json",
         }
         if github_token:
-            self.headers["Authorization"] = f"Bearer {github_token}"
+            self.api_headers["Authorization"] = f"Bearer {github_token}"
 
-    def fetch_trending_repos(self, count: int = 10) -> List[Dict]:
+        self.web_headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
+
+    def _is_llm_agent_related(self, repo: Dict) -> bool:
+        """判断一个项目是否与 LLM / Agent 相关"""
+        text = " ".join([
+            repo.get("name", "").lower(),
+            repo.get("description", "").lower(),
+            " ".join(repo.get("topics", [])).lower(),
+        ])
+        return any(kw in text for kw in self.LLM_AGENT_KEYWORDS)
+
+    def _parse_star_count(self, text: str) -> int:
+        """将 '1,234' 或 '1.2k' 等字符串转换为整数"""
+        text = text.strip().replace(",", "").replace(" ", "")
+        if text.endswith("k") or text.endswith("K"):
+            return int(float(text[:-1]) * 1000)
+        try:
+            return int(text)
+        except ValueError:
+            return 0
+
+    # ------------------------------------------------------------------
+    # GitHub Trending 页面抓取
+    # ------------------------------------------------------------------
+
+    def _scrape_trending_page(self, url: str) -> List[Dict]:
         """
-        获取 GitHub 上热门的大模型 / Agent 开源项目
+        抓取一个 GitHub Trending 页面，返回项目列表。
 
-        Args:
-            count: 返回项目数量，默认 10
-
-        Returns:
-            项目列表，按 star 数降序排列
+        每个项目包含：name, url, description, language, stars, forks,
+        stars_today, topics, updated_at
         """
+        repos: List[Dict] = []
+        try:
+            response = requests.get(url, headers=self.web_headers, timeout=30)
+            if response.status_code != 200:
+                print(f"  ⚠️ Trending 页面返回 {response.status_code}: {url}")
+                return repos
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            articles = soup.select("article.Box-row")
+
+            for article in articles:
+                try:
+                    # 仓库名称 & URL
+                    h2 = article.select_one("h2")
+                    if not h2:
+                        continue
+                    a_tag = h2.select_one("a")
+                    if not a_tag:
+                        continue
+                    repo_path = a_tag.get("href", "").strip("/")
+                    if not repo_path or repo_path.count("/") != 1:
+                        continue
+                    repo_url = f"https://github.com/{repo_path}"
+                    repo_name = repo_path  # "owner/repo"
+
+                    # 描述
+                    p_tag = article.select_one("p")
+                    description = p_tag.get_text(strip=True) if p_tag else ""
+
+                    # 编程语言
+                    lang_span = article.select_one(
+                        'span[itemprop="programmingLanguage"]'
+                    )
+                    language = lang_span.get_text(strip=True) if lang_span else ""
+
+                    # 总 Stars & Forks（页面上的小图标链接）
+                    stat_links = article.select("a.Link--muted")
+                    stars = 0
+                    forks = 0
+                    for link in stat_links:
+                        href = link.get("href", "")
+                        text = link.get_text(strip=True)
+                        if "/stargazers" in href:
+                            stars = self._parse_star_count(text)
+                        elif "/forks" in href:
+                            forks = self._parse_star_count(text)
+
+                    # 今日 star 增量
+                    stars_today = 0
+                    for span in article.select("span"):
+                        span_text = span.get_text(strip=True)
+                        if "stars today" in span_text or "star today" in span_text:
+                            # 格式："1,234 stars today"
+                            parts = span_text.split()
+                            if parts:
+                                stars_today = self._parse_star_count(parts[0])
+                            break
+
+                    repos.append(
+                        {
+                            "name": repo_name,
+                            "description": description,
+                            "stars": stars,
+                            "forks": forks,
+                            "stars_today": stars_today,
+                            "url": repo_url,
+                            "language": language,
+                            "topics": [],          # topics 通过 API 补充
+                            "updated_at": "",      # updated_at 通过 API 补充
+                        }
+                    )
+                except Exception as exc:
+                    print(f"  ⚠️ 解析 Trending 条目失败: {exc}")
+
+        except Exception as exc:
+            print(f"  ✗ 抓取 Trending 页面失败 ({url}): {exc}")
+
+        return repos
+
+    def _enrich_with_api(self, repo: Dict) -> Dict:
+        """
+        通过 GitHub API 补充项目的 topics 字段（及修正 stars/forks 数据）。
+        失败时静默返回原始 repo。
+        """
+        try:
+            api_url = f"https://api.github.com/repos/{repo['name']}"
+            response = requests.get(api_url, headers=self.api_headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                repo["topics"] = data.get("topics", [])
+                repo["stars"] = data.get("stargazers_count", repo["stars"])
+                repo["forks"] = data.get("forks_count", repo["forks"])
+                try:
+                    repo["updated_at"] = datetime.fromisoformat(
+                        data["updated_at"].replace("Z", "+00:00")
+                    ).strftime("%Y-%m-%d")
+                except (ValueError, KeyError):
+                    pass
+        except Exception:
+            pass
+        return repo
+
+    # ------------------------------------------------------------------
+    # GitHub Search API 兜底
+    # ------------------------------------------------------------------
+
+    def _fetch_from_search_api(self, count: int) -> List[Dict]:
+        """
+        当 Trending 页面无法提供足够的 LLM/Agent 项目时，
+        通过 GitHub Search API 查询最近 7 天内有推送活动的相关项目。
+        """
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
         all_repos: List[Dict] = []
         seen_ids: set = set()
 
-        for query in self.SEARCH_QUERIES:
+        for query in self.FALLBACK_QUERIES:
             try:
                 url = "https://api.github.com/search/repositories"
                 params = {
-                    "q": query,
+                    "q": f"{query} pushed:>{since} stars:>100",
                     "sort": "stars",
                     "order": "desc",
                     "per_page": 30,
                 }
                 response = requests.get(
-                    url, headers=self.headers, params=params, timeout=30
+                    url, headers=self.api_headers, params=params, timeout=30
                 )
                 if response.status_code == 200:
                     data = response.json()
@@ -193,7 +361,7 @@ class GitHubTrendingFetcher:
                             try:
                                 updated_date = datetime.fromisoformat(
                                     repo["updated_at"].replace("Z", "+00:00")
-                                ).strftime('%Y-%m-%d')
+                                ).strftime("%Y-%m-%d")
                             except (ValueError, KeyError):
                                 updated_date = repo.get("updated_at", "")[:10]
                             all_repos.append(
@@ -202,6 +370,7 @@ class GitHubTrendingFetcher:
                                     "description": description,
                                     "stars": repo["stargazers_count"],
                                     "forks": repo["forks_count"],
+                                    "stars_today": 0,
                                     "url": repo["html_url"],
                                     "language": repo.get("language") or "",
                                     "topics": repo.get("topics", []),
@@ -216,17 +385,75 @@ class GitHubTrendingFetcher:
                 else:
                     print(f"  ⚠️ GitHub API 返回异常状态码: {response.status_code}")
 
-                # 避免触发 GitHub 次要速率限制
                 time.sleep(1)
 
-            except Exception as e:
-                print(f"  ✗ GitHub 抓取失败: {str(e)}")
+            except Exception as exc:
+                print(f"  ✗ GitHub Search API 抓取失败: {exc}")
 
-        # 按 star 数降序排列，取前 count 个
         all_repos.sort(key=lambda x: x["stars"], reverse=True)
-        top_repos = all_repos[:count]
-        print(f"✓ 共获取到 {len(top_repos)} 个 GitHub 热门大模型/Agent 开源项目")
-        return top_repos
+        return all_repos[:count]
+
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+
+    def fetch_trending_repos(self, count: int = 10) -> List[Dict]:
+        """
+        获取最近 24 小时 star 增加最多的 LLM/Agent 开源项目。
+
+        优先从 GitHub Trending（每日）页面抓取并过滤，结果不足时
+        通过 GitHub Search API 兜底。
+
+        Args:
+            count: 返回项目数量，默认 10
+
+        Returns:
+            项目列表，按今日 star 增量降序排列
+        """
+        all_trending: List[Dict] = []
+        seen_names: set = set()
+
+        # 1. 从各 Trending 页面收集候选项目
+        for url in self.TRENDING_URLS:
+            repos = self._scrape_trending_page(url)
+            for repo in repos:
+                if repo["name"] not in seen_names:
+                    seen_names.add(repo["name"])
+                    all_trending.append(repo)
+            time.sleep(0.5)
+
+        print(f"  从 Trending 页面共收集到 {len(all_trending)} 个项目，开始过滤 LLM/Agent 相关项目…")
+
+        # 2. 过滤 LLM/Agent 相关项目
+        llm_repos = [r for r in all_trending if self._is_llm_agent_related(r)]
+        print(f"  过滤后剩余 {len(llm_repos)} 个 LLM/Agent 相关项目")
+
+        # 3. 若不足 count 个，通过 GitHub Search API 兜底
+        if len(llm_repos) < count:
+            print(f"  LLM/Agent Trending 项目不足 {count} 个，启用 GitHub Search API 兜底…")
+            fallback = self._fetch_from_search_api(count - len(llm_repos))
+            existing_repo_names = {r["name"] for r in llm_repos}
+            for repo in fallback:
+                if repo["name"] not in existing_repo_names:
+                    existing_repo_names.add(repo["name"])
+                    llm_repos.append(repo)
+
+        # 4. 按今日 star 增量降序排列，取前 count 个
+        llm_repos.sort(key=lambda x: x["stars_today"], reverse=True)
+        top_repos = llm_repos[:count]
+
+        # 5. 通过 API 补充 topics / updated_at 等详细信息
+        #    来自 Trending 页面的项目 topics 为空列表，需要通过 API 补充；
+        #    来自 Search API 兜底的项目已包含完整信息，无需重复请求。
+        enriched: List[Dict] = []
+        for repo in top_repos:
+            if not repo.get("topics"):
+                repo = self._enrich_with_api(repo)
+                time.sleep(0.3)
+            enriched.append(repo)
+
+        print(f"✓ 共获取到 {len(enriched)} 个最近24小时 star 增加最多的 LLM/Agent 开源项目")
+        return enriched
 
 
 class AINewsFetcher:
@@ -515,7 +742,7 @@ class AINewsFetcher:
         # ── GitHub热门大模型/Agent项目 ──────────────────────────
         if self.github_repos:
             content_lines.append("---\n\n")
-            content_lines.append("## 🔥 GitHub热门大模型/Agent开源项目 TOP 10\n\n")
+            content_lines.append("## 🔥 GitHub LLM/Agent 开源项目·24小时 Star 飙升榜 TOP 10\n\n")
             for i, repo in enumerate(self.github_repos, 1):
                 content_lines.append(f"### {i}. [{repo['name']}]({repo['url']})\n")
 
@@ -526,10 +753,13 @@ class AINewsFetcher:
                 topics_str = ""
                 if repo.get('topics'):
                     topics_str = f"标签: {', '.join(repo['topics'][:5])}  "
+                stars_today = repo.get('stars_today', 0)
+                today_str = f"🚀 今日新增: +{stars_today:,}  " if stars_today else ""
+                updated_str = f"- 🕐 最近更新: {repo['updated_at']}\n\n" if repo.get('updated_at') else "\n"
                 content_lines.append(
-                    f"- ⭐ Stars: {repo['stars']:,}  🍴 Forks: {repo['forks']:,}\n"
+                    f"- {today_str}⭐ Stars: {repo['stars']:,}  🍴 Forks: {repo['forks']:,}\n"
                     f"- {lang_str}{topics_str}\n"
-                    f"- 🕐 最近更新: {repo['updated_at']}\n\n"
+                    + updated_str
                 )
 
         content_lines.append("\n---\n")
@@ -618,7 +848,7 @@ class AINewsFetcher:
         # ── GitHub热门大模型/Agent项目 ──────────────────────────
         if self.github_repos:
             paragraphs.append([_text("─" * 30)])
-            paragraphs.append([_bold("🔥 GitHub热门大模型/Agent开源项目 TOP 10")])
+            paragraphs.append([_bold("🔥 GitHub LLM/Agent 开源项目·24小时 Star 飙升榜 TOP 10")])
             for i, repo in enumerate(self.github_repos, 1):
                 row = [_text(f"{i}. ")]
                 row.append(_link(repo['name'], repo['url']))
@@ -631,8 +861,11 @@ class AINewsFetcher:
                     paragraphs.append([_text(f"   💡 {desc}")])
 
                 lang_str = f"  语言: {repo['language']}" if repo.get('language') else ""
+                stars_today = repo.get('stars_today', 0)
+                today_str = f"  🚀 今日+{stars_today:,}" if stars_today else ""
+                updated_str = f"  🕐 {repo['updated_at']}" if repo.get('updated_at') else ""
                 paragraphs.append([
-                    _text(f"   ⭐ {repo['stars']:,}  🍴 {repo['forks']:,}{lang_str}  🕐 {repo['updated_at']}")
+                    _text(f"   ⭐ {repo['stars']:,}  🍴 {repo['forks']:,}{today_str}{lang_str}{updated_str}")
                 ])
 
         paragraphs.append([_text("─" * 30)])
